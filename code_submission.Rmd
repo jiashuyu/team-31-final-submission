@@ -1,0 +1,204 @@
+---
+title: "draft"
+author: "Shuyu"
+date: "2/14/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(dbscan)
+library(randomForest)
+library(RColorBrewer)
+```
+
+```{r loading data message=F warning=F}
+# load data
+P1 = read_csv(file = "Part1.csv")
+P2 = read_csv(file = "Part2.csv")
+P3 = read_csv(file = "Part3.csv")
+P4a = read_csv(file = "Part4a.csv")
+P4b = read_csv(file = "Part4b.csv")
+P5 = read_csv(file = "Part5.csv")
+
+zips = read_delim(file = "zipcode-coordinates.csv", ";")
+agi = read_csv(file = "zipcode_agiincome.csv", col_types = "ci")
+pop = read_csv("pop-by-zip-code.csv")
+
+# delete first row (descriptions)
+P1 = P1[-1,]
+P2 = P2[-1,]
+P3 = P3[-1,]
+P4a = P4a[-1,]
+P4b = P4b[-1,]
+P5 = P5[-1,]
+
+# combine them together
+data = rbind(P1,P2,P3,P4a,P4b,P5)
+
+# clean up memory
+rm(P1, P2, P3, P4a, P4b, P5)
+```
+
+```{r data cleaning}
+# data wrangling
+  # only keep NAICS.id with 3 digits(reduce sample size)
+  # you will get message "NAs introduced by coercion"
+  # don't worry that's data where NAICS id == 44-45 (anyway we don't need them)
+mydata = data %>% 
+         mutate(RCPSZFE.id = as.numeric(RCPSZFE.id),
+                ESTAB = as.numeric(ESTAB),
+                NAICS.id = as.numeric(NAICS.id),
+                rcpszfe_avg = case_when(RCPSZFE.id == 114 ~ 87500,
+                                        RCPSZFE.id == 123 ~ 175000,
+                                        RCPSZFE.id == 125 ~ 375000,
+                                        RCPSZFE.id == 131 ~ 750000,
+                                        RCPSZFE.id == 132 ~ 1500000,
+                                        RCPSZFE.id == 998 ~ 0,
+                                        TRUE              ~ 0),
+                sales = rcpszfe_avg * ESTAB) %>%
+         filter(NAICS.id >= 100 & NAICS.id <= 999 & RCPSZFE.id > 2) %>%
+         select(-GEO.id, -`GEO.display-label`, -`NAICS.display-label`, 
+                -`RCPSZFE.display-label`, -RCPSZFE.id, -YEAR.id)
+
+# keep only one row for each zip * 3-digit-NAICS combination
+grouped_data = mydata %>% 
+               group_by(GEO.id2, NAICS.id) %>%
+               summarise(sales = sum(sales), estab = sum(ESTAB))
+
+grouped_data$GEO.id2 = sapply(grouped_data$GEO.id2, function(x){if(nchar(x)<5){paste0("0",x)}else{x}})
+rm(mydata)
+
+# clean coordinates data
+reduced_zip = zips %>% select(c("Zip", "Latitude", "Longitude", "City", "State"))
+
+# clean population data
+reduced_pop = pop %>% select(zip_code, `y-2012`)
+
+# clean income dataset
+cleaned_agi = agi %>%
+              filter(zipcode != "99999" & zipcode != "0")
+
+cleaned_agi$zipcode = sapply(cleaned_agi$zipcode, 
+                             function(x){if(nchar(x)<5){paste0("0",x)}else{x}})
+
+# merge original data with coordinates/population/income data
+cleaned_data = left_join(x = grouped_data, y = reduced_zip, by = c("GEO.id2" = "Zip"))
+cleaned_data = left_join(x = cleaned_data, y = reduced_pop, by = c("GEO.id2" = "zip_code"))
+cleaned_data = left_join(x = cleaned_data, y = cleaned_agi, by = c("GEO.id2" = "zipcode"))
+rm(grouped_data, reduced_zip, reduced_pop, cleaned_agi)
+head(cleaned_data)
+
+# fill na in income
+# drop na rows (we could fix it manually, 
+# but that will take us a lot of time)
+# rename all columns
+# generate new variable: population / #establishments
+median_income = median(cleaned_data$agi_income, na.rm = T)
+final_data = cleaned_data %>%
+             mutate(agi_income = ifelse(is.na(agi_income), median_income, agi_income)) %>%
+             mutate(pop_per_estab = `y-2012` / estab) %>%
+             select(-City, estab, `y-2012`) %>%
+             rename(zip = GEO.id2,
+                    industry = NAICS.id,
+                    latitude = Latitude,
+                    longitude = Longitude,
+                    state = State,
+                    population = `y-2012`,
+                    income = agi_income) %>%
+             drop_na()
+
+rm(cleaned_data)
+final_data = as.data.frame(final_data)
+head(final_data)
+write_csv(final_data, path = "a_whole_new_dataset.csv")
+```
+
+```{r clustering}
+# we only do cluster to zip-level data
+data_cluster = final_data %>%
+               select(zip, longitude, latitude, state) %>%
+               distinct()
+
+# run dbscan
+new_cat = dbscan(model.matrix(~ latitude + longitude + state, data_cluster), 
+                 eps = 1.4, 
+                 borderPoints = TRUE, 
+                 minPts = 150)
+data_cluster[, "cluster"] = new_cat$cluster
+
+ggplot() +
+  geom_point(data = data_cluster, 
+             aes(longitude, latitude, color = as.factor(cluster)),
+             size = 1) +
+  theme_classic()
+  #geom_point(data = coord_info[which(coord_info$cluster == 0), ], aes(Longitude, Latitude), color = "black")
+
+# join cluster result to our dataset
+final_data = left_join(final_data, data_cluster[, c("zip", "cluster")], by = "zip")
+```
+
+```{r random forest}
+# our dependent variable is: sales
+# our independent variables are: industry, population, income, cluster
+# we don't use pop_per_estab because it has strong relationship with sales,
+  # and may lead us to incorrect result when doing model fitting
+
+# split data: illinois for testing, others for training
+# we also split 30% from training data as validating set
+testing_i = which(final_data$state == "IL")
+length(testing_i) / nrow(final_data)
+testing = final_data[testing_i, ] # 6879 obs
+training = final_data[-testing_i, ]
+
+set.seed(1)
+validating_i = sample(1:nrow(training), 0.3*nrow(training))
+validating = training[validating_i, ] # 49692 obs
+training = training[-validating_i, ] # 115948 obs
+
+
+# run fandom forest
+xtrain = training[, c("industry", "population", "income", "cluster")]
+ytrain = log(training$sales + 1)
+xvalid = validating[, c("industry", "population", "income", "cluster")]
+yvalid = validating$sales
+
+
+
+rf1 = randomForest(xtrain, ytrain, nodesize = 100, ntree = 300, seed = 1)
+rf1$importance
+
+ypred = exp(predict(rf1, xvalid))
+sqrt(mean((ypred - yvalid)^2))
+mean(yvalid)
+
+
+imp = data.frame(Feature = rownames(rf1$importance), rf1$importance)
+imp
+
+
+ggplot(imp, aes(Feature, IncNodePurity, group = 1)) +
+  geom_bar(stat = "identity", fill = brewer.pal(n = 4, name = "PuRd")) +
+  theme_classic() +
+  coord_flip() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.line.x = element_blank(),
+        axis.title.x = element_text(size = 20),
+        axis.text.y = element_text(size = 20),
+        axis.title.y = element_text(size = 20),
+  )
+```
+
+```{r}
+xtest = testing[, c("industry", "population", "income", "cluster")]
+ytest = testing$sales
+ypred = exp(predict(rf1, xtest))
+diff = ypred - ytest
+rank(diff) <= 5
+testing$zip[rank(diff) <= 5]
+
+str(diff)
+```
+
